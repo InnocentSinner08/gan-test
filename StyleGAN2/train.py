@@ -3,7 +3,8 @@
 # This StyleGAN2 implementation is taken from https://github.com/rosinality/stylegan2-pytorch.
 
 ###
-
+from collections import deque
+import numpy as np
 import argparse
 import math
 import random
