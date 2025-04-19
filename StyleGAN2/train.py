@@ -159,9 +159,10 @@ def should_prune(loss_window, epsilon=0.001):
     mean2 = np.mean(second_half)
 
     return abs(mean1 - mean2) < epsilon
-cooldown = 0
-cooldown_interval = 100  # don't switch again for 100 iterations
+
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, fid_record, sample_z):
+    cooldown = 0
+    cooldown_interval = 100  # don't switch again for 100 iterations
     g_loss_window = deque(maxlen=100)
     prune_triggered = False
     loader = sample_data(loader)
