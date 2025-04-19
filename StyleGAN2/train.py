@@ -159,6 +159,8 @@ def should_prune(loss_window, epsilon=0.001):
     mean2 = np.mean(second_half)
 
     return abs(mean1 - mean2) < epsilon
+cooldown = 0
+cooldown_interval = 100  # don't switch again for 100 iterations
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, fid_record, sample_z):
     g_loss_window = deque(maxlen=100)
     prune_triggered = False
@@ -202,31 +204,45 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             break
 
         if args.regan:
-    # Warm-up: train as dense model
             if i < args.warmup_iter:
                 generator.train_on_sparse = False
             else:
-                # Add current loss to sliding window
                 g_loss_window.append(g_loss.item())
 
-                # Condition to switch to sparse mode (loss has plateaued)
-                if should_prune(g_loss_window) and not generator.train_on_sparse:
-                    print(f"[{i}] Switching to SPARSE mode based on loss stabilization")
-                    generator.turn_training_mode(mode='sparse')
-                    for param_group in g_optim.param_groups:
-                        param_group['lr'] = args.lr
-                    prune_triggered = True
-
-                # Condition to switch back to dense (loss increased after pruning)
-                elif prune_triggered and len(g_loss_window) >= g_loss_window.maxlen:
-                    recent = list(g_loss_window)[-50:]
-                    previous = list(g_loss_window)[:50]
-                    if np.mean(recent) > np.mean(previous):
-                        print(f"[{i}] Switching to DENSE mode due to loss increase")
-                        generator.turn_training_mode(mode='dense')
+                if cooldown == 0:
+                    if should_prune(g_loss_window) and not generator.train_on_sparse:
+                        print(f"[{i}] Switching to SPARSE mode based on loss stabilization")
+                        generator.turn_training_mode(mode='sparse')
                         for param_group in g_optim.param_groups:
-                            param_group['lr'] = args.lr * 0.1
-                        prune_triggered = False
+                            param_group['lr'] = args.lr
+                        prune_triggered = True
+                        cooldown = cooldown_interval  # block switching for next 100 iters
+
+                    elif prune_triggered and len(g_loss_window) >= g_loss_window.maxlen:
+                        recent = list(g_loss_window)[-50:]
+                        previous = list(g_loss_window)[:50]
+                        if np.mean(recent) > np.mean(previous):
+                            print(f"[{i}] Switching to DENSE mode due to loss increase")
+                            
+                            # Switch back to dense mode
+                            generator.turn_training_mode(mode='dense')
+
+                            # Perform gradient-based regrowth
+                            if hasattr(generator, 'regrow_weights_by_gradient'):
+                                print(f"[{i}] Performing gradient-based regrowth")
+                                generator.regrow_weights_by_gradient(regrow_fraction=args.regrow_frac)
+
+                            # Update optimizer learning rate
+                            for param_group in g_optim.param_groups:
+                                param_group['lr'] = args.lr * 0.1
+
+                            prune_triggered = False
+                            cooldown = cooldown_interval
+
+
+                else:
+                    cooldown -= 1
+
 
 
         real_img = next(loader)
@@ -411,6 +427,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
+    parser.add_argument('--regrow_frac', type=float, default=0.05, help="Fraction of weights to regrow during dense phase")
+
     parser.add_argument(
         "--batch", type=int, default=16, help="batch sizes for each gpus"
     )

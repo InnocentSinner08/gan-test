@@ -39,6 +39,27 @@ class Regan_training(nn.Module):
             self.masks.append(mask_w)
 
         return self.masks
+    
+    def regrow_weights_by_gradient(self, regrow_fraction=0.1):
+        for i, (w, m) in enumerate(zip(self.layers, self.masks)):
+            if w.grad is None:
+                continue
+
+            grad = torch.abs(w.grad.detach())
+            num_weights = grad.numel()
+            k = int(num_weights * regrow_fraction)
+
+            # Flatten gradient and get top-k indices
+            topk = torch.topk(grad.view(-1), k=k)
+            topk_indices = topk.indices
+
+            # Create a regrow mask with same shape as weights
+            regrow_mask = torch.zeros_like(w, dtype=torch.bool).view(-1)
+            regrow_mask[topk_indices] = True
+            regrow_mask = regrow_mask.view_as(w)
+
+            # Update the binary mask (set those bits to False = unmasked = regrow)
+            self.masks[i][regrow_mask] = False
 
     def update_masks(self):
 
