@@ -129,8 +129,20 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
+def should_prune(loss_window, epsilon=0.001):
+    if len(loss_window) < loss_window.maxlen:
+        return False
 
+    first_half = list(loss_window)[:len(loss_window)//2]
+    second_half = list(loss_window)[len(loss_window)//2:]
+
+    mean1 = np.mean(first_half)
+    mean2 = np.mean(second_half)
+
+    return abs(mean1 - mean2) < epsilon
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, fid_record, sample_z):
+    g_loss_window = deque(maxlen=100)
+    prune_triggered = False
     loader = sample_data(loader)
 
     pbar = range(1, 1 + args.iter)
@@ -171,47 +183,32 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             break
 
         if args.regan:
-            # Warm-up phase, do not enable the ReGAN training
-            if i < args.warmup_iter + 1:
-                # print('current is warmup training')
+    # Warm-up: train as dense model
+            if i < args.warmup_iter:
                 generator.train_on_sparse = False
+            else:
+                # Add current loss to sliding window
+                g_loss_window.append(g_loss.item())
 
-            # Warm-up phase finished, get into Sparse training phase
-            elif i > args.warmup_iter and flag_g < args.g + 1:
-                # print('iteration: %d, current is sparse training' % i)
-                # turn training mode to sparse, update mask
-                generator.turn_training_mode(mode='sparse')
-                # make sure the learning rate of sparse phase is the original one
-                if flag_g == 1:
-                    print('turn learning rate to normal')
-                    for params in g_optim.param_groups:
-                        params['lr'] = args.lr
-                flag_g = flag_g + 1
+                # Condition to switch to sparse mode (loss has plateaued)
+                if should_prune(g_loss_window) and not generator.train_on_sparse:
+                    print(f"[{i}] Switching to SPARSE mode based on loss stabilization")
+                    generator.turn_training_mode(mode='sparse')
+                    for param_group in g_optim.param_groups:
+                        param_group['lr'] = args.lr
+                    prune_triggered = True
 
-            # Sparse training phase finished, get into dense training phase
-            elif i > args.warmup_iter and flag_g < 2 * args.g + 1:
-                # print('iteration: %d, current is dense training' % i)
-                # turn training mode to dense
-                generator.turn_training_mode(mode='dense')
-                # make sure the learning rate of Dense phase is 10 times smaller than the original one
-                if flag_g == args.g + 1:
-                    print('turn learning rate to 10 times smaller')
-                    for params in g_optim.param_groups:
-                        params['lr'] = args.lr * 0.1
-                flag_g = flag_g + 1
+                # Condition to switch back to dense (loss increased after pruning)
+                elif prune_triggered and len(g_loss_window) >= g_loss_window.maxlen:
+                    recent = list(g_loss_window)[-50:]
+                    previous = list(g_loss_window)[:50]
+                    if np.mean(recent) > np.mean(previous):
+                        print(f"[{i}] Switching to DENSE mode due to loss increase")
+                        generator.turn_training_mode(mode='dense')
+                        for param_group in g_optim.param_groups:
+                            param_group['lr'] = args.lr * 0.1
+                        prune_triggered = False
 
-                # When curren Sparse-Dense pair training finished, get into next pair training
-                if flag_g == 2 * args.g + 1:
-                    print('clean flag')
-                    flag_g = 1
-
-                if i % 50 == 0:
-                    if generator.train_on_sparse:
-                        print('Iter:%d, G_Sparse' % i)
-                        print(g_optim.param_groups[0]['lr'])
-                    else:
-                        print('Iter:%d, G_Dense' % i)
-                        print(g_optim.param_groups[0]['lr'])
 
         real_img = next(loader)
         real_img = real_img.to(device)
