@@ -37,6 +37,24 @@ from diffaug import DiffAugment
 import warnings
 warnings.filterwarnings("ignore")
 
+import csv
+import os
+
+root_dir = './results'  # Define root_dir before usage
+log_dir = os.path.join(root_dir, 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+g_log_file = open(os.path.join(log_dir, 'g_loss.csv'), mode='w', newline='')
+d_log_file = open(os.path.join(log_dir, 'd_loss.csv'), mode='w', newline='')
+fid_log_file = open(os.path.join(log_dir, 'fid_score.csv'), mode='w', newline='')
+
+g_logger = csv.writer(g_log_file)
+d_logger = csv.writer(d_log_file)
+fid_logger = csv.writer(fid_log_file)
+
+g_logger.writerow(["iteration", "g_loss"])
+d_logger.writerow(["iteration", "d_loss"])
+fid_logger.writerow(["iteration", "fid_score"])
 
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
@@ -329,6 +347,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
+        g_logger.writerow([i, g_loss_val])
+        d_logger.writerow([i, d_loss_val])
+
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
 
@@ -371,6 +392,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     '%s/%s.pt' % (ckpt_dir, 'best_ckpt'),
                 )
                 print('Current fid is: %f' % fid)
+                fid_logger.writerow([i, fid])
+
             else:
                 fid_record.append(fid)
                 print('Current fid is: %f' % fid)
