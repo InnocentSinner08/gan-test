@@ -151,8 +151,9 @@ def set_grad_none(model, targets):
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, fid_record, sample_z):
     import os
     import csv
+    from collections import deque
+    mask_snapshots = deque(maxlen=2)  # keep only current and previous
 
-    mask_snapshots = []
     mask_similarity_log = []
 
     def clone_masks(masks):
@@ -219,11 +220,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 curr_mask = clone_masks(generator.masks)
                 mask_snapshots.append(curr_mask)
 
-                if len(mask_snapshots) >= 2:
-                    prev_mask = mask_snapshots[-2]
-                    sim = compute_mask_similarity(prev_mask, curr_mask)
-                    print(f"[{i}] 🔍 Mask similarity with previous prune: {sim:.4f}")
+                if len(mask_snapshots) >= 1:
+                    prev_mask = mask_snapshots[0]
+                    sim = compute_mask_similarity(prev_mask, generator.masks)
                     mask_similarity_log.append((i, sim))
+
+                # Replace the previous mask
+                mask_snapshots.clear()
+                mask_snapshots.append(clone_masks(generator.masks))
                 # make sure the learning rate of sparse phase is the original one
                 if flag_g == 1:
                     print('turn learning rate to normal')
