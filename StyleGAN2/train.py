@@ -163,9 +163,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         total = 0
         match = 0
         for m1, m2 in zip(mask1, mask2):
+            m1, m2 = m1.to(torch.bool).cpu(), m2.detach().to(torch.bool).cpu()
             total += m1.numel()
             match += ((m1 == m2) & m1).sum().item()
         return match / total if total != 0 else 0
+
 
     loader = sample_data(loader)
 
