@@ -24,7 +24,7 @@ try:
 
 except ImportError:
     wandb = None
-from dataset import MultiResolutionDataset
+from dataset import CIFAR10Dataset
 from distributed import (
     get_rank,
     synchronize,
@@ -40,6 +40,7 @@ warnings.filterwarnings("ignore")
 
 import csv
 import os
+from torchvision import datasets as tv_datasets
 
 root_dir = './results'  # Define root_dir before usage
 log_dir = os.path.join(root_dir, 'logs')
@@ -393,7 +394,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
 
             print('-------------Eva FID------------')
-            fid = fid_score.calculate_fid_given_paths([eva_dir, '../dataset/%s/img' % args.dataset],
+            fid = fid_score.calculate_fid_given_paths([eva_dir, args.real_img_dir],
                                                       100, device, 2048)
             if fid <= best_fid:
                 torch.save(
@@ -423,7 +424,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("--dataset", type=str, help="path to the lmdb dataset")
+    parser.add_argument("--dataset", type=str, default="cifar10", help="dataset name (default: cifar10)")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
@@ -431,7 +432,7 @@ if __name__ == "__main__":
     parser.add_argument('--regrow_frac', type=float, default=0.05, help="Fraction of weights to regrow during dense phase")
 
     parser.add_argument(
-        "--batch", type=int, default=16, help="batch sizes for each gpus"
+        "--batch", type=int, default=64, help="batch sizes for each gpus"
     )
     parser.add_argument(
         "--n_sample",
@@ -440,7 +441,13 @@ if __name__ == "__main__":
         help="number of the samples generated during training",
     )
     parser.add_argument(
-        "--size", type=int, default=256, help="image sizes for the model"
+        "--size", type=int, default=32, help="image sizes for the model (32 for CIFAR-10)"
+    )
+    parser.add_argument(
+        "--data_root", type=str, default="./data", help="root dir for dataset download"
+    )
+    parser.add_argument(
+        "--data_ratio", type=float, default=1.0, help="fraction of training data to use (0.0-1.0)"
     )
     parser.add_argument(
         "--r1", type=float, default=10, help="weight of the r1 regularization"
@@ -532,7 +539,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    args.path = '../dataset/%slmdb' % args.dataset
+    # args.path is no longer needed for CIFAR-10 (auto-downloaded by torchvision)
     if args.regan:
         root_dir = './results/%s_g_%d_s_%.1f' % (args.dataset, args.g, args.sparsity)
     else:
@@ -633,21 +640,38 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    transform = transforms.Compose(
-        [
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        ]
+    # --- CIFAR-10 Dataset ---
+    dataset = CIFAR10Dataset(
+        root=args.data_root,
+        size=args.size,
+        train=True,
+        data_ratio=args.data_ratio,
     )
-
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
     )
+
+    # --- Save real CIFAR-10 images for FID evaluation ---
+    real_img_dir = os.path.join(root_dir, 'real_images')
+    args.real_img_dir = real_img_dir
+    if get_rank() == 0 and not os.path.exists(real_img_dir):
+        os.makedirs(real_img_dir, exist_ok=True)
+        print('Saving real CIFAR-10 images for FID computation...')
+        cifar10_raw = tv_datasets.CIFAR10(
+            root=args.data_root, train=True, download=False,
+            transform=transforms.Compose([
+                transforms.Resize(args.size),
+                transforms.ToTensor(),
+            ])
+        )
+        num_fid = min(args.eva_size, len(cifar10_raw))
+        for idx in tqdm(range(num_fid), desc='Saving real images'):
+            img_tensor, _ = cifar10_raw[idx]
+            utils.save_image(img_tensor, os.path.join(real_img_dir, f'real_{idx}.png'))
+        print(f'Saved {num_fid} real images to {real_img_dir}')
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")

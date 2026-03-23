@@ -1,8 +1,10 @@
 from io import BytesIO
 
 import lmdb
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import datasets, transforms
 
 
 class MultiResolutionDataset(Dataset):
@@ -37,4 +39,39 @@ class MultiResolutionDataset(Dataset):
         img = Image.open(buffer)
         img = self.transform(img)
 
+        return img
+
+
+class CIFAR10Dataset(Dataset):
+    """CIFAR-10 dataset wrapper for StyleGAN2 training.
+
+    Auto-downloads CIFAR-10 via torchvision. Returns only images (no labels)
+    to match the MultiResolutionDataset interface.
+    """
+
+    def __init__(self, root='./data', size=32, train=True, data_ratio=1.0):
+        self.transform = transforms.Compose([
+            transforms.Resize(size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+        self.dataset = datasets.CIFAR10(
+            root=root,
+            train=train,
+            download=True,
+            transform=self.transform,
+        )
+
+        # Support using a subset of the data (e.g., data_ratio=0.1 for 10%)
+        total = len(self.dataset)
+        self.num_samples = int(total * data_ratio)
+        self.indices = np.arange(self.num_samples)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index):
+        img, _label = self.dataset[self.indices[index]]
         return img
