@@ -181,6 +181,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     mean_path_length_avg = 0
     loss_dict = {}
 
+    # Track best FID locally so "best_ckpt" is genuinely the best, not the latest.
+    best_fid = min(fid_record) if len(fid_record) else float("inf")
+
     if args.distributed:
         g_module = generator.module
         d_module = discriminator.module
@@ -189,7 +192,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_module = generator
         d_module = discriminator
 
-    accum = 0.5 ** (32 / (10 * 1000))
+    # EMA half-life of ~10k images; must scale with the actual batch size.
+    accum = 0.5 ** (args.batch / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
 
     policy = 'color,translation,cutout'
@@ -332,7 +336,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         g_optim.step()
 
-        g_regularize = i % args.g_reg_every == 0
+        g_regularize = (not args.disable_path_reg) and (i % args.g_reg_every == 0)
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
@@ -382,6 +386,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             )
 
         if i % args.eva_iter == 0:
+            # clear previous eval images so a smaller run can't leave stale files behind
+            for f in os.listdir(eva_dir):
+                if f.startswith('f_') and f.endswith('.png'):
+                    os.remove(os.path.join(eva_dir, f))
+
             with torch.no_grad():
                 eva_bs = 50
                 for ii in tqdm(range(args.eva_size // eva_bs), desc='Generating Images'):
@@ -392,35 +401,43 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                                 '%s/f_%s.png' % (eva_dir, str(iii + ii * eva_bs)),
                                     normalize=True, value_range=(-1, 1))
 
-
             print('-------------Eva FID------------')
             fid = fid_score.calculate_fid_given_paths([eva_dir, args.real_img_dir],
                                                       100, device, 2048)
-            if fid <= best_fid:
-                torch.save(
-                    {
-                        "g": g_module.state_dict(),
-                        "d": d_module.state_dict(),
-                        "g_ema": g_ema.state_dict(),
-                        "g_optim": g_optim.state_dict(),
-                        "d_optim": d_optim.state_dict(),
-                        "args": args,
-                        'fid_record': fid_record,
-                        'sample_z': sample_z,
-                        'saved_iter': i
-                    },
-                    '%s/%s.pt' % (ckpt_dir, 'best_ckpt'),
-                )
-                print('Current fid is: %f' % fid)
-                fid_logger.writerow([i, fid])
+            fid_record.append(fid)
+            fid_logger.writerow([i, fid])      # log EVERY eval, not just improvements
+            fid_log_file.flush()
+            g_log_file.flush()
+            d_log_file.flush()
+            print('Current fid is: %f (best so far: %f)' % (fid, min(best_fid, fid)))
 
-            else:
-                fid_record.append(fid)
-                print('Current fid is: %f' % fid)
+            ckpt_payload = {
+                "g": g_module.state_dict(),
+                "d": d_module.state_dict(),
+                "g_ema": g_ema.state_dict(),
+                "g_optim": g_optim.state_dict(),
+                "d_optim": d_optim.state_dict(),
+                "args": args,
+                'fid_record': fid_record,
+                'sample_z': sample_z,
+                'saved_iter': i,
+            }
+            # always keep a resumable "latest" checkpoint
+            torch.save(ckpt_payload, '%s/%s.pt' % (ckpt_dir, 'latest_ckpt'))
+            # only overwrite "best" when FID genuinely improves
+            if fid <= best_fid:
+                best_fid = fid
+                torch.save(ckpt_payload, '%s/%s.pt' % (ckpt_dir, 'best_ckpt'))
+                print('** New best FID: %f -> saved best_ckpt' % fid)
 
 
 if __name__ == "__main__":
     device = "cuda"
+
+    # --- Speed: enable cuDNN autotuner + TF32 matmuls (big win on Ampere+ / A100/T4) ---
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
@@ -450,7 +467,23 @@ if __name__ == "__main__":
         "--data_ratio", type=float, default=1.0, help="fraction of training data to use (0.0-1.0)"
     )
     parser.add_argument(
-        "--r1", type=float, default=10, help="weight of the r1 regularization"
+        "--r1", type=float, default=1.0,
+        help="weight of the r1 regularization (gamma). 10 is tuned for FFHQ 256-1024; "
+             "for CIFAR-10 32px try ~0.1-1.0 and sweep. ADA heuristic: 0.0002*size^2/batch.",
+    )
+    parser.add_argument(
+        "--n_mlp", type=int, default=2,
+        help="mapping network depth. 8 for large datasets; 2 is the StyleGAN2-ADA "
+             "CIFAR config and trains faster.",
+    )
+    parser.add_argument(
+        "--disable_path_reg", action="store_true",
+        help="skip path-length regularization (recommended for CIFAR: faster + no quality loss)",
+    )
+    parser.add_argument(
+        "--fid_n_real", type=int, default=10000,
+        help="number of real images cached as the FID reference set. The standard "
+             "CIFAR-10 FID protocol uses all 50000; use 50000 for publishable numbers.",
     )
     parser.add_argument(
         "--path_regularize",
@@ -560,7 +593,7 @@ if __name__ == "__main__":
         synchronize()
 
     args.latent = 512
-    args.n_mlp = 8
+    # args.n_mlp now comes from --n_mlp (default 2 for CIFAR)
 
     args.start_iter = 0
 
@@ -667,7 +700,7 @@ if __name__ == "__main__":
                 transforms.ToTensor(),
             ])
         )
-        num_fid = min(args.eva_size, len(cifar10_raw))
+        num_fid = min(args.fid_n_real, len(cifar10_raw))
         for idx in tqdm(range(num_fid), desc='Saving real images'):
             img_tensor, _ = cifar10_raw[idx]
             utils.save_image(img_tensor, os.path.join(real_img_dir, f'real_{idx}.png'))
